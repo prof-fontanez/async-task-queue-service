@@ -1,13 +1,17 @@
 package com.acme.api.asynctaskqueue.model;
 
 import java.time.Instant;
-import java.util.UUID;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
+/**
+ * A regular Java POJO responsible to hold a job's state. Purposely designed for mutability
+ * since this is a lifecycle object, and the job status will change over time.
+ */
 public class Job {
     private final String jobId;
     private final String type;
-    private final Object payload;
+    private final Map<String, Object> payload;
     private final String idempotencyKey;
 
     private JobStatus status;
@@ -16,8 +20,8 @@ public class Job {
     private Instant startedAt;
     private Instant completedAt;
 
-    public Job(String type, Object payload, String idempotencyKey) {
-        this.jobId = UUID.randomUUID().toString();
+    public Job(String jobId, String type, Map<String, Object> payload, String idempotencyKey) {
+        this.jobId = jobId;
         this.type = type;
         this.payload = payload;
         this.idempotencyKey = idempotencyKey;
@@ -32,7 +36,7 @@ public class Job {
         return type;
     }
 
-    public Object getPayload() {
+    public Map<String, Object> getPayload() {
         return payload;
     }
 
@@ -52,8 +56,8 @@ public class Job {
         return attempts.get();
     }
 
-    public void incrementAttempts() {
-        attempts.incrementAndGet();
+    public int incrementAttempts() {
+        return attempts.incrementAndGet();
     }
 
     public String getLastError() {

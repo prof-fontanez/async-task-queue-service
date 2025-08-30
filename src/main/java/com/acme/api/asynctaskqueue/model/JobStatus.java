@@ -5,5 +5,6 @@ public enum JobStatus {
     RUNNING,
     SUCCEEDED,
     FAILED,
+    COMPENSATION_FAILED,
     COMPENSATED
 }
