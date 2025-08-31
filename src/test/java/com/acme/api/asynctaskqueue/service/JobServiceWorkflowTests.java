@@ -2,6 +2,7 @@ package com.acme.api.asynctaskqueue.service;
 
 import com.acme.api.asynctaskqueue.jobs.dto.JobRequest;
 import com.acme.api.asynctaskqueue.jobs.dto.JobStatusResponse;
+import com.acme.api.asynctaskqueue.metrics.JobMetrics;
 import com.acme.api.asynctaskqueue.model.Job;
 import com.acme.api.asynctaskqueue.model.JobStatus;
 import com.acme.api.asynctaskqueue.repo.JobRepository;
@@ -26,8 +27,8 @@ public class JobServiceWorkflowTests {
     private ThreadPoolExecutor compensationExecutor;
     private ScheduledExecutorService retryScheduler;
     private JobService service;
+    private JobMetrics metrics;
 
-    // in-memory store to simulate repository
     private ConcurrentMap<String, Job> jobsMap;
 
     @BeforeEach
@@ -36,21 +37,43 @@ public class JobServiceWorkflowTests {
 
         repo = mock(JobRepository.class);
         registry = mock(JobHandlerRegistry.class);
+        metrics = new JobMetrics(); // real metrics
         normalExecutor = (ThreadPoolExecutor) Executors.newFixedThreadPool(2);
         compensationExecutor = (ThreadPoolExecutor) Executors.newFixedThreadPool(1);
         retryScheduler = Executors.newSingleThreadScheduledExecutor();
 
-        // mock save() to store jobs in jobsMap
+        // simulate repo save()
         doAnswer(invocation -> {
             Job j = invocation.getArgument(0);
             jobsMap.put(j.getJobId(), j);
-            return null; // save() is void
+            return null;
         }).when(repo).save(any(Job.class));
 
-        // mock findById() to return jobs from jobsMap
+        // simulate repo findById()
         when(repo.findById(anyString())).thenAnswer(invocation -> jobsMap.get(invocation.getArgument(0)));
 
-        service = new JobService(repo, normalExecutor, compensationExecutor, retryScheduler, registry);
+        service = new JobService(repo, normalExecutor, compensationExecutor, retryScheduler, registry, metrics);
+    }
+
+    private void printJobMetrics(String testName) {
+        System.out.println("===== Metrics after test: " + testName + " =====");
+        System.out.println("Completed jobs: " + metrics.getCompletedJobs());
+        System.out.println("Average job duration (ms): " + metrics.getAverageJobTimeMs());
+        System.out.println("========================================");
+    }
+
+    private void waitForJobCompletion(String jobId, long timeoutMs) throws InterruptedException {
+        long start = System.currentTimeMillis();
+        while (System.currentTimeMillis() - start < timeoutMs) {
+            Job job = jobsMap.get(jobId);
+            if (job != null && (
+                    job.getStatus() == JobStatus.SUCCEEDED ||
+                            job.getStatus() == JobStatus.COMPENSATED ||
+                            job.getStatus() == JobStatus.COMPENSATION_FAILED)) {
+                return;
+            }
+            Thread.sleep(50);
+        }
     }
 
     @Test
@@ -61,11 +84,12 @@ public class JobServiceWorkflowTests {
         JobRequest req = new JobRequest("EMAIL", Map.of("to", "user@test.com"), null);
         Job job = service.submitJob(req);
 
-        // Wait for async execution to complete
         waitForJobCompletion(job.getJobId(), 3000);
 
         assertEquals(JobStatus.SUCCEEDED, job.getStatus());
         verify(handler, times(1)).execute(req.payload());
+
+        printJobMetrics("testSuccessfulJobExecution");
     }
 
     @Test
@@ -80,12 +104,13 @@ public class JobServiceWorkflowTests {
         JobRequest req = new JobRequest("REPORT", Map.of("reportId", 42), null);
         Job job = service.submitJob(req);
 
-        // Wait for retries + success
         waitForJobCompletion(job.getJobId(), 4000);
 
         assertEquals(JobStatus.SUCCEEDED, job.getStatus());
         assertTrue(job.getAttempts() >= 2);
         verify(handler, atLeast(3)).execute(any());
+
+        printJobMetrics("testRetryWithJitter");
     }
 
     @Test
@@ -98,12 +123,13 @@ public class JobServiceWorkflowTests {
         JobRequest req = new JobRequest("REPORT", Map.of("reportId", 99), null);
         Job job = service.submitJob(req);
 
-        // Wait for retries + compensation
         waitForJobCompletion(job.getJobId(), 5000);
 
         assertEquals(JobStatus.COMPENSATED, job.getStatus());
         verify(handler, atLeast(3)).execute(any());
         verify(handler, times(1)).compensate(any());
+
+        printJobMetrics("testCompensationTriggeredAfterMaxRetries");
     }
 
     @Test
@@ -116,11 +142,12 @@ public class JobServiceWorkflowTests {
         JobRequest req = new JobRequest("EMAIL", Map.of("to", "fail@test.com"), null);
         Job job = service.submitJob(req);
 
-        // Wait for retries + failed compensation
         waitForJobCompletion(job.getJobId(), 5000);
 
         assertEquals(JobStatus.COMPENSATION_FAILED, job.getStatus());
         assertTrue(job.getLastError().contains("compensation failed"));
+
+        printJobMetrics("testCompensationFailure");
     }
 
     @Test
@@ -133,18 +160,17 @@ public class JobServiceWorkflowTests {
         JobRequest req2 = new JobRequest("EMAIL", Map.of("to", "second@test.com"), key);
 
         Job job1 = service.submitJob(req1);
-
-        // Wait for async execution to complete
         waitForJobCompletion(job1.getJobId(), 3000);
 
         Job job2 = service.submitJob(req2);
 
-        assertEquals(job1.getJobId(), job2.getJobId()); // same job returned
+        assertEquals(job1.getJobId(), job2.getJobId());
 
-        // Verify that the handler was executed once with first payload
         ArgumentCaptor<Map<String, Object>> captor = ArgumentCaptor.forClass(Map.class);
         verify(handler, times(1)).execute(captor.capture());
         assertEquals("first@test.com", captor.getValue().get("to"));
+
+        printJobMetrics("testDuplicateIdempotencyKey");
     }
 
     @Test
@@ -160,20 +186,7 @@ public class JobServiceWorkflowTests {
         assertEquals("SUCCEEDED", resp.status());
         assertEquals(0, resp.attempts());
         assertNull(resp.lastError());
-    }
 
-    // utility: wait until job status is terminal
-    private void waitForJobCompletion(String jobId, long timeoutMs) throws InterruptedException {
-        long start = System.currentTimeMillis();
-        while (System.currentTimeMillis() - start < timeoutMs) {
-            Job job = jobsMap.get(jobId);
-            if (job != null && (
-                    job.getStatus() == JobStatus.SUCCEEDED ||
-                            job.getStatus() == JobStatus.COMPENSATED ||
-                            job.getStatus() == JobStatus.COMPENSATION_FAILED)) {
-                return;
-            }
-            Thread.sleep(50);
-        }
+        printJobMetrics("testGetJobStatus");
     }
 }

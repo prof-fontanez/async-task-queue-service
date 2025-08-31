@@ -2,6 +2,7 @@ package com.acme.api.asynctaskqueue.service;
 
 import com.acme.api.asynctaskqueue.jobs.dto.JobRequest;
 import com.acme.api.asynctaskqueue.jobs.dto.JobStatusResponse;
+import com.acme.api.asynctaskqueue.metrics.JobMetrics;
 import com.acme.api.asynctaskqueue.model.*;
 import com.acme.api.asynctaskqueue.repo.JobRepository;
 import com.acme.api.asynctaskqueue.worker.JobHandler;
@@ -45,19 +46,24 @@ public class JobService {
     private final ThreadPoolExecutor compensationExecutor;
     private final ScheduledExecutorService retryScheduler;
     private final JobHandlerRegistry handlers;
+    private final JobMetrics metrics;
     private final ConcurrentMap<String, String> idemIndex = new ConcurrentHashMap<>();
 
     private static final int MAX_ATTEMPTS = 3;
-    private static final long BASE_DELAY_MS = 500L; // 0.5s, doubles each retry
+    private static final long BASE_DELAY_MS = 500L;
 
-    public JobService(JobRepository repo, @Qualifier("normalJobExecutor") ThreadPoolExecutor normalExecutor,
+    public JobService(JobRepository repo,
+                      @Qualifier("normalJobExecutor") ThreadPoolExecutor normalExecutor,
                       @Qualifier("compensationJobExecutor") ThreadPoolExecutor compensationExecutor,
-                      ScheduledExecutorService retryScheduler, JobHandlerRegistry handlers) {
+                      ScheduledExecutorService retryScheduler,
+                      JobHandlerRegistry handlers,
+                      JobMetrics metrics) {
         this.repo = repo;
         this.normalExecutor = normalExecutor;
         this.compensationExecutor = compensationExecutor;
         this.retryScheduler = retryScheduler;
         this.handlers = handlers;
+        this.metrics = metrics;
     }
 
     public Job submitJob(JobRequest req) {
@@ -71,7 +77,6 @@ public class JobService {
 
         Job job = new Job(UUID.randomUUID().toString(), req.type(), req.payload(), req.idempotencyKey());
 
-        // Put idempotency mapping eagerly
         if (job.getIdempotencyKey() != null) {
             idemIndex.putIfAbsent(job.getIdempotencyKey(), job.getJobId());
         }
@@ -79,7 +84,7 @@ public class JobService {
         repo.save(job);
 
         try {
-            enqueue(job); // may throw RejectedExecutionException -> controller returns 429
+            enqueue(job);
         } catch (RejectedExecutionException rex) {
             logger.warn("Job {} rejected due to backpressure (queue full)", job.getJobId(), rex);
             throw rex;
@@ -103,6 +108,8 @@ public class JobService {
         repo.save(job);
 
         JobHandler handler = handlers.get(job.getType());
+        long startTime = System.currentTimeMillis();
+
         try {
             handler.execute(job.getPayload());
 
@@ -111,7 +118,6 @@ public class JobService {
             repo.save(job);
 
             logger.info("Execution SUCCEEDED for Job {}", jobId);
-
         } catch (Exception ex) {
             job.setLastError(ex.getMessage());
             int retryCount = job.incrementAttempts();
@@ -131,7 +137,6 @@ public class JobService {
                     }
                 }, delay, TimeUnit.MILLISECONDS);
             } else {
-                // compensation
                 job.setStatus(JobStatus.FAILED);
                 repo.save(job);
 
@@ -150,16 +155,24 @@ public class JobService {
                     } catch (Exception cx) {
                         String lastKnownError = job.getLastError() == null ? "UNKNOWN" : job.getLastError();
                         job.setStatus(JobStatus.COMPENSATION_FAILED);
-                        job.setLastError(lastKnownError + " | " + "compensation: " + cx.getMessage());
+                        job.setLastError(lastKnownError + " | compensation: " + cx.getMessage());
                         logger.error("Compensation FAILED for Job {}. Last known error: {}", jobId, lastKnownError, cx);
                     } finally {
                         job.setCompletedAt(Instant.now());
                         repo.save(job);
                         logger.info("Job {} final status: {}", jobId, job.getStatus());
+                        // Record metrics here after compensation
+                        long duration = System.currentTimeMillis() - startTime;
+                        metrics.recordJobDuration(duration);
                     }
                 });
+                return; // do not record metrics twice
             }
         }
+
+        // Record metrics for successful or retried jobs
+        long duration = System.currentTimeMillis() - startTime;
+        metrics.recordJobDuration(duration);
     }
 
     private long backoffWithJitter(int attemptNumber) {
